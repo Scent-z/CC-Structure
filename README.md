@@ -1,6 +1,6 @@
 # CC-Structure
 ## 每一章都是在永不改变的 while True 循环之上叠加一种新机制, 循环属于 Agent，而机制属于框架
-## 全部 20 章的核心要义，就是教你如何在这个循环外围构建一切
+## 全部 20 章的核心要义，就是如何在这个循环外围构建一切
 s01 | Agent Loop | 核心循环 | messages / while True / stop_reason | 一个循环与 Bash 足矣 |
 s02 | Tool Use | 工具分发 | TOOL_HANDLERS / 分发映射 / 并发 | 添加工具即添加处理器 |
 s03 | Permission | 安全边界 | PermissionRule / 审批管线 | 先设边界，后予自由 |
