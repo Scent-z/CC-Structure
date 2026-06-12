@@ -30,6 +30,11 @@ The Agent Loop
 两个While True循环, 内循环用于Agent loop, LLM自己决定何时使用工具何时停止(核心循环), 外循环用于多轮对话
 """
 
+# NOTE
+"""
+基于 CC 源码 `src/query.ts`（1729 行）的核查
+核心差异就两个 (1) CC 不看 `stop_reason` 字段而是检查内容里有没有 tool_use 块（因为流式响应中 stop_reason 不可靠）(2) CC 有更多的退出路径和恢复策略做生产级保护
+"""
 
 import os
 import subprocess  # Python 标准库中用于创建和管理子进程的模块
