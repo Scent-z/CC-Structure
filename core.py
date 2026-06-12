@@ -1,3 +1,4 @@
+# Agent系统最底层最核心的循环, 其他所有逻辑围绕这个循环逐步扩展
 def agent_loop(messages):
     while True:
         response = client.messages.create(
