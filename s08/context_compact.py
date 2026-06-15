@@ -251,7 +251,7 @@ def spawn_subagent(task: str) -> str:
         if not result:
             result = "Subagent stopped after 30 turns without final answer."
     print(f"\033[35m[Subagent done]\033[0m")
-    return result
+    return result  # # 子代理仅仅返回一个总结, 丢弃整个对话消息历史, 不污染主对话, only summary, entire message history discarded
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -453,6 +453,7 @@ def compact_history(messages):
 
 # ✅️
 # Emergency: reactiveCompact — on API error
+# 最激进的裁剪策略 (只保留摘要和最近的5条策略)
 def reactive_compact(messages):
     """当执行完前四层压缩但内容还是很多即 API 仍然返回 prompt_too_long 错误时触发 (上下文增长速度快于压缩触发速度时)"""
     transcript = write_transcript(messages)
