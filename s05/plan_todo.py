@@ -143,6 +143,9 @@ def _normalize_todos(todos):
 # ✅️
 # 工具6
 def run_todo_write(todos: list) -> str:
+    """
+    更新任务状态 (LLM 在整个执行过程中会多次调用)
+    """
     global CURRENT_TODOS
     todos, error = _normalize_todos(todos)
     if error:
@@ -166,8 +169,17 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "glob", "description": "Find files matching a glob pattern.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
-    {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
-     "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
+    
+    {"name": "todo_write", 
+     "description": "Create and manage a task list for your current coding session.",
+     "input_schema": {"type": "object", 
+                      "properties": {
+                            "todos": {"type": "array", 
+                                      "items": {"type": "object", 
+                                                "properties": {"content": {"type": "string"}, 
+                                                               "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}},
+                                                               "required": ["content", "status"]}}},
+                      "required": ["todos"]}},
 ]
 
 TOOL_HANDLERS = {

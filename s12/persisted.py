@@ -1,25 +1,23 @@
 """
-错误恢复 (Error Recovery) —— 三种恢复路径 + 指数退避机制
+任务系统 (Task System) —— 基于文件持久化的任务图, 支持 blockedBy 依赖关系
 
-Changes from s10:
-  - LLM 调用被封装在 try/except 中, 并设计了三种异常恢复路径
-  - 恢复路径 1: 当触发 max_tokens 限制时, 先将最大输出长度从 8K 提升至 64K (首次扩容时不追加续写提示), 若仍未完成, 则使用续写提示 (continuation prompt) 继续生成, 最多续写 3 次
-  - 恢复路径 2: 当出现 prompt_too_long 错误时, 触发响应式压缩 (reactive compact), 然后重新发起请求 (仅重试一次)
-  - 恢复路径 3: 当遇到 429 或 529 错误时, 采用带随机抖动 (jitter)的指数退避重试策略 (最多重试 10 次); 若连续出现 529 错误, 则切换到备用模型
-  - 用于处理瞬时错误 (Transient Errors) 的 with_retry 重试封装器
-  - RecoveryState 用于跟踪恢复过程中的状态信息, 包括扩容 (escalation)、上下文压缩 (compact)、529 错误次数以及当前使用的模型
+Changes from s11:
+  - Task 数据类 (dataclass): 包含 id、subject、description、status、owner、blockedBy 等字段
+  - TASKS_DIR = .tasks/ for persistent JSON storage
+  - create_task / save_task / load_task / list_tasks / get_task
+  - can_start: 检查 blockedBy 中的所有依赖任务是否均已完成 (如果存在缺失的依赖任务, 也视为被阻塞)
+  - claim_task: set owner + pending -> in_progress
+  - complete_task: 将任务状态设置为已完成 (completed), 并返回因此解除阻塞的下游任务
+  - 5 new tools: create_task, list_tasks, get_task, claim_task, complete_task
 
-ASCII flow:
-  messages -> prompt assembly -> compress+load -> [try] LLM [except] -> tools -> loop
-                                                    |          |
-                                              stop_reason   error type
-                                              max_tokens?   prompt_too_long? -> compact
-                                              escalate /    429/529? -> backoff
-                                              continue      other? -> log + exit
+Note: 教学示例代码保留了一个基础的 Agent 循环, 以便将重点放在任务系统本身, 
+S11 中完整的错误恢复机制 (RecoveryState、退避重试、升级处理、响应式压缩、备用模型) 被省略了
+ — 在真实的 CC 系统中, tasks.ts 和 withRetry 是彼此独立的层, 它们能够自然地组合在一起
 """
 
-import os, subprocess, time, random, json
+import os, subprocess, json, time, random
 from pathlib import Path
+from dataclasses import dataclass, asdict
 
 try:
     import readline
@@ -38,27 +36,105 @@ WORKDIR = Path.cwd()
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-PRIMARY_MODEL = os.environ["MODEL_ID"]
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID")
+MODEL = os.environ["MODEL_ID"]
 
-# ── Constants ──
+TASKS_DIR = WORKDIR / ".tasks"
+TASKS_DIR.mkdir(exist_ok=True)
 
-ESCALATED_MAX_TOKENS = 64000
-DEFAULT_MAX_TOKENS = 8000
-MAX_RECOVERY_RETRIES = 3
-MAX_RETRIES = 10
-BASE_DELAY_MS = 500  # 基础等待0.5秒
-MAX_CONSECUTIVE_529 = 3
-CONTINUATION_PROMPT = (
-    "Output token limit hit. Resume directly — "
-    "no apology, no recap. Pick up mid-thought."
-)
+@dataclass
+class Task:
+    id: str
+    subject: str
+    description: str
+    status: str          # 待执行 | 执行中 | 已完成
+    owner: str | None    # 负责该任务的 Agent 名称 (多 Agent 场景)
+    blockedBy: list[str] # 当前任务依赖的任务 ID 列表
 
-# ── Prompt Assembly (from s10, synced) ──
+# ✅️
+def _task_path(task_id: str) -> Path:
+    return TASKS_DIR / f"{task_id}.json"
+
+# ✅️
+def create_task(subject: str, description: str = "",
+                blockedBy: list[str] | None = None) -> Task:
+    task = Task(
+        id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
+        subject=subject,
+        description=description,
+        status="pending",
+        owner=None,  
+        blockedBy=blockedBy or [],
+    )
+    save_task(task)
+    return task
+
+# ✅️
+def save_task(task: Task):
+    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2))
+
+# ✅️
+def load_task(task_id: str) -> Task:
+    return Task(**json.loads(_task_path(task_id).read_text()))
+
+# ✅️
+def list_tasks() -> list[Task]:
+    return [Task(**json.loads(p.read_text()))
+            for p in sorted(TASKS_DIR.glob("task_*.json"))]
+
+# ✅️
+def get_task(task_id: str) -> str:
+    """以 JSON 格式返回完整的任务详情"""
+    task = load_task(task_id)
+    return json.dumps(asdict(task), indent=2)
+
+# ✅️
+def can_start(task_id: str) -> bool:  # 一个任务只能在它的 `blockedBy` **全部 completed** 之后才能开始
+    """检查 blockedBy 中的所有依赖任务是否已经完成
+    如果某个依赖任务不存在 (缺失), 则认为当前任务仍处于阻塞状态"""
+    task = load_task(task_id)
+    for dep_id in task.blockedBy:
+        if not _task_path(dep_id).exists():
+            return False
+        if load_task(dep_id).status != "completed":
+            return False
+    return True
+
+# ✅️
+def claim_task(task_id: str, owner: str = "agent") -> str:
+    """将任务状态设置为执行中 (in_progress)"""
+    task = load_task(task_id)
+    if task.status != "pending":
+        return f"Task {task_id} is {task.status}, cannot claim"
+    if not can_start(task_id):
+        deps = [d for d in task.blockedBy
+                if not _task_path(d).exists() or load_task(d).status != "completed"]
+        return f"Blocked by: {deps}"
+    task.owner = owner
+    task.status = "in_progress"
+    save_task(task)
+    print(f"  \033[36m[claim] {task.subject} → in_progress (owner: {owner})\033[0m")
+    return f"Claimed {task.id} ({task.subject})"
+
+# ✅️
+def complete_task(task_id: str) -> str:
+    task = load_task(task_id)
+    if task.status != "in_progress":
+        return f"Task {task_id} is {task.status}, cannot complete"
+    task.status = "completed"
+    save_task(task)
+    unblocked = [t.subject for t in list_tasks()
+                 if t.status == "pending" and t.blockedBy and can_start(t.id)]
+    print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
+    msg = f"Completed {task.id} ({task.subject})"
+    if unblocked:
+        msg += f"\nUnblocked: {', '.join(unblocked)}"
+        print(f"  \033[33m[unblocked] {', '.join(unblocked)}\033[0m")
+    return msg
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
-    "tools": "Available tools: bash, read_file, write_file.",
+    "tools": "Available tools: bash, read_file, write_file, "
+             "create_task, list_tasks, get_task, claim_task, complete_task.",
     "workspace": f"Working directory: {WORKDIR}",
     "memory": "Relevant memories are injected below when available.",
 }
@@ -93,15 +169,9 @@ def get_system_prompt(context: dict) -> str:
     global _last_context_key, _last_prompt
     key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
     if key == _last_context_key and _last_prompt:
-        print("  \033[90m[cache hit] system prompt unchanged\033[0m")
         return _last_prompt
     _last_context_key = key
     _last_prompt = assemble_system_prompt(context)
-
-    loaded = ["identity", "tools", "workspace"]
-    if context.get("memories"):
-        loaded.append("memory")
-    print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
     return _last_prompt
 
 MEMORY_TYPES = ["user", "feedback", "project", "reference"]
@@ -439,9 +509,9 @@ def run_read(path: str, limit: int | None = None) -> str:
 # 工具3: 往文件里写内容
 def run_write(path: str, content: str) -> str:
     try:
-        file_path = safe_path(path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content)
+        fp = safe_path(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content)
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -517,6 +587,43 @@ def spawn_subagent(task: str) -> str:
         if not result: result = "Subagent stopped after 30 turns without final answer."
     print(f"\033[35m[Subagent done]\033[0m")
 
+def run_create_task(subject: str, description: str = "",
+                    blockedBy: list[str] | None = None) -> str:
+    task = create_task(subject, description, blockedBy)
+    deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
+    print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
+    return f"Created {task.id}: {task.subject}{deps}"
+
+
+def run_list_tasks() -> str:
+    tasks = list_tasks()
+    if not tasks:
+        return "No tasks. Use create_task to add some."
+    lines = []
+    for t in tasks:
+        icon = {"pending": "○", "in_progress": "●",
+                "completed": "✓"}.get(t.status, "?")
+        deps = f" (blockedBy: {', '.join(t.blockedBy)})" if t.blockedBy else ""
+        owner = f" [{t.owner}]" if t.owner else ""
+        lines.append(f"  {icon} {t.id}: {t.subject} "
+                     f"[{t.status}]{owner}{deps}")
+    return "\n".join(lines)
+
+
+def run_get_task(task_id: str) -> str:
+    try:
+        return get_task(task_id)
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
+
+
+def run_claim_task(task_id: str) -> str:
+    return claim_task(task_id, owner="agent")
+
+
+def run_complete_task(task_id: str) -> str:
+    return complete_task(task_id)
+
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -530,10 +637,43 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
     {"name": "task", "description": "Launch a subagent to handle a subtask.",
      "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}},
+    
+    {"name": "create_task",
+     "description": "Create a new task with optional blockedBy dependencies.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "subject": {"type": "string"},
+                          "description": {"type": "string"},
+                          "blockedBy": {"type": "array",
+                                        "items": {"type": "string"}}},
+                      "required": ["subject"]}},
+    {"name": "list_tasks",
+     "description": "List all tasks with status, owner, and dependencies.",
+     "input_schema": {"type": "object", "properties": {},
+                      "required": []}},
+    {"name": "get_task",
+     "description": "Get full details of a specific task by ID.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
+    {"name": "claim_task",
+     "description": "Claim a pending task. Sets owner, changes status to in_progress.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
+    {"name": "complete_task",
+     "description": "Complete an in-progress task. Reports unblocked downstream tasks.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
 ]
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob, "task": spawn_subagent,
+
+     "create_task": run_create_task, "list_tasks": run_list_tasks,
+    "get_task": run_get_task, "claim_task": run_claim_task,
+    "complete_task": run_complete_task,
 }
 
 SUB_TOOLS = [
@@ -730,8 +870,6 @@ register_hook("PreToolUse", log_hook)
 register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
-# ── Error Recovery (s11 new) ──
-
 # ✅️
 class RecoveryState:
     """在整个重试循环过程中跟踪恢复尝试次数"""
@@ -819,9 +957,8 @@ def reactive_compact(messages: list) -> list:
              "content": "[Reactive compact] Earlier conversation trimmed. "
                         "Continue from where you left off."}, *tail]
 
-# ✅️
 def update_context(context: dict, messages: list) -> dict:
-    """从真实运行状态中推导上下文信息: 包括当前可用的工具, 以及是否存在记忆文件 (memory files)"""
+    """从真实状态推导上下文: 包括当前有哪些工具可用, 以及记忆文件是否存在"""
     memories = ""
     if MEMORY_INDEX.exists():
         content = MEMORY_INDEX.read_text().strip()
@@ -833,72 +970,29 @@ def update_context(context: dict, messages: list) -> dict:
         "memories": memories,
     }
 
+# ── Agent Loop (为了突出任务系统, 进行了简化处理) ──
 # ✅️
 def agent_loop(messages: list, context: dict):
-    """Main loop with error recovery wrapping LLM calls."""
     system = get_system_prompt(context)
-    state = RecoveryState()
-    max_tokens = DEFAULT_MAX_TOKENS
-
     while True:
-        # ── LLM call: with_retry handles 429/529, outer handles rest ──
         try:
-            response = with_retry(
-                lambda mt=max_tokens, mdl=state.current_model:
-                    client.messages.create(
-                        model=mdl, 
-                        system=system, 
-                        messages=messages,
-                        tools=TOOLS, 
-                        max_tokens=mt),
-                state)
+            response = client.messages.create(
+                                                model=MODEL, 
+                                                system=system, 
+                                                messages=messages,
+                                                tools=TOOLS, 
+                                                max_tokens=8000
+                                            )
         except Exception as e:
-            # Path 2: prompt_too_long -> reactive compact (once)
-            if is_prompt_too_long_error(e):
-                if not state.has_attempted_reactive_compact:
-                    messages[:] = reactive_compact(messages)
-                    state.has_attempted_reactive_compact = True
-                    continue
-                print("  \033[31m[unrecoverable] still too long after compact\033[0m")
-                messages.append({"role": "assistant", "content": [
-                    {"type": "text",
-                     "text": "[Error] Context too large, cannot continue."}]})
-                return
-
-            # 不可恢复
-            name = type(e).__name__
-            print(f"  \033[31m[unrecoverable] {name}: {str(e)[:100]}\033[0m")
             messages.append({"role": "assistant", "content": [
-                {"type": "text", "text": f"[Error] {name}: {str(e)[:200]}"}]})
+                {"type": "text",
+                 "text": f"[Error] {type(e).__name__}: {e}"}]})
             return
 
-        # ── Path 1: max_tokens -> escalate or continue ──
-        if response.stop_reason == "max_tokens":  # 模型话说一半 token 用完了
-            # 首次扩容时: 不要追加被截断的输出, 而是使用相同请求重新发起调用
-            if not state.has_escalated:
-                max_tokens = ESCALATED_MAX_TOKENS  # 扩大模型的输出长度 (64k)
-                state.has_escalated = True
-                print(f"  \033[33m[max_tokens] escalating"
-                      f" {DEFAULT_MAX_TOKENS} -> {ESCALATED_MAX_TOKENS}\033[0m")
-                continue
-            # 64K 输出上限下仍然被截断: 保存当前已生成的内容, 并使用续写提示 (continuation prompt) 继续生成 (即让模型接着说, 将上次没说完的说完)
-            messages.append({"role": "assistant", "content": response.content})
-            if state.recovery_count < MAX_RECOVERY_RETRIES:
-                messages.append({"role": "user", "content": CONTINUATION_PROMPT})
-                state.recovery_count += 1
-                print(f"  \033[33m[max_tokens] continuation"
-                      f" {state.recovery_count}/{MAX_RECOVERY_RETRIES}\033[0m")
-                continue
-            print("  \033[31m[max_tokens] recovery limit reached\033[0m")
-            return
-
-        # Normal completion: append assistant response
         messages.append({"role": "assistant", "content": response.content})
-
         if response.stop_reason != "tool_use":
             return
 
-        # ── Tool execution ──
         results = []
         for block in response.content:
             if block.type != "tool_use":
@@ -906,34 +1000,30 @@ def agent_loop(messages: list, context: dict):
             print(f"\033[36m> {block.name}\033[0m")
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
-            print(str(output)[:200])
+            print(str(output)[:300])
             results.append({"type": "tool_result",
                             "tool_use_id": block.id, "content": output})
         messages.append({"role": "user", "content": results})
-
         context = update_context(context, messages)
         system = get_system_prompt(context)
 
+
 if __name__ == "__main__":
-    print("s11: error recovery")
+    print("s12: task system")
     print("Enter a question, press Enter to send. Type q to quit.\n")
     history = []
     context = update_context({}, [])
     while True:
         try:
-            query = input("\033[36ms11 >> \033[0m")
+            query = input("\033[36ms12 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
-        turn_start = len(history)
         history.append({"role": "user", "content": query})
         agent_loop(history, context)
         context = update_context(context, history)
-        for msg in history[turn_start:]:
-            if msg.get("role") != "assistant":
-                continue
-            for block in msg["content"]:
-                if getattr(block, "type", None) == "text":
-                    print(block.text)
+        for block in history[-1]["content"]:
+            if getattr(block, "type", None) == "text":
+                print(block.text)
         print()
